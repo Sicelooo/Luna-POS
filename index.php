@@ -1,10 +1,13 @@
-<?php
+<<?php
 session_start();
 
+// ----------------------------------------------------
+// DATABASE CONNECTION CONFIGURATION
+// ----------------------------------------------------
 $dbHost = getenv('DB_HOST') ?: '127.0.0.1';
-$dbName = getenv('DB_NAME') ?: '';
+$dbName = getenv('DB_NAME') ?: 'aberrant';
 $dbUser = getenv('DB_USER') ?: 'root';
-$dbPass = getenv('DB_PASS') ?: '';
+$dbPass = getenv('DB_PASS') ?: '@b3rrAntS0ft';
 
 try {
     $pdo = new PDO("mysql:host=$dbHost;dbname=$dbName;charset=utf8mb4", $dbUser, $dbPass, [
@@ -19,6 +22,218 @@ try {
         exit;
     }
     die("Database Connection Failed: " . $e->getMessage());
+}
+
+// ----------------------------------------------------
+// LIVE SUBSCRIPTION ENFORCEMENT SYSTEM (tblnyuku)
+// Always checks tblnyuku directly on every page load
+// ----------------------------------------------------
+class LicenseManager
+{
+    private PDO $pdo;
+
+    public function __construct(PDO $pdo)
+    {
+        $this->pdo = $pdo;
+    }
+
+    public function getSystemFingerprint(): string
+    {
+        return strtoupper(hash('sha256', php_uname('n') . php_uname('m')));
+    }
+
+    public function activateWithKey(string $rawKey): array
+    {
+        $fingerprint = $this->getSystemFingerprint();
+        $rawKey = trim($rawKey);
+
+        if (empty($rawKey)) {
+            return ['status' => 'error', 'message' => 'Please enter a valid activation key.'];
+        }
+
+        // Fetch unused keys to check hash
+        $stmt = $this->pdo->query("SELECT id, key_hash, duration_days FROM tblnyuku WHERE is_used = 0");
+        $keys = $stmt->fetchAll();
+
+        $matchedKey = null;
+        foreach ($keys as $k) {
+            if (password_verify($rawKey, $k['key_hash'])) {
+                $matchedKey = $k;
+                break;
+            }
+        }
+
+        if (!$matchedKey) {
+            return ['status' => 'error', 'message' => 'Invalid key or key has already been used.'];
+        }
+
+        $days        = (int)$matchedKey['duration_days'];
+        $activatedAt = date('Y-m-d H:i:s');
+        $expiresAt   = date('Y-m-d 23:59:59', strtotime("+$days days"));
+
+        // Revoke any previously active licenses in tblnyuku for this terminal (set is_used = 2)
+        $this->pdo->prepare("UPDATE tblnyuku SET is_used = 2 WHERE used_by_fingerprint = ? AND is_used = 1")->execute([$fingerprint]);
+
+        // Mark current key as active (is_used = 1)
+        $updateStmt = $this->pdo->prepare("
+            UPDATE tblnyuku 
+            SET is_used = 1, 
+                used_by_fingerprint = ?, 
+                activated_at = ?, 
+                expires_at = ? 
+            WHERE id = ?
+        ");
+        $updateStmt->execute([$fingerprint, $activatedAt, $expiresAt, $matchedKey['id']]);
+
+        // Sync active state in tblregistration
+        $this->pdo->exec("DELETE FROM tblregistration");
+        $regStmt = $this->pdo->prepare("
+            INSERT INTO tblregistration (ComputerName, CheckSum, Expires, ExpiryDate, LisenseNumber) 
+            VALUES (?, 'NYUKU_OK', 1, ?, 'NYUKU-SUBSCRIPTION')
+        ");
+        $regStmt->execute([$fingerprint, $expiresAt]);
+
+        return ['status' => 'success', 'message' => "Subscription activated for {$days} days!"];
+    }
+
+    public function validateLicense(): array
+    {
+        try {
+            $fingerprint = $this->getSystemFingerprint();
+
+            // 1. LIVE CHECK IN tblnyuku FOR THIS HARDWARE FINGERPRINT
+            $stmt = $this->pdo->prepare("
+                SELECT id, expires_at 
+                FROM tblnyuku 
+                WHERE used_by_fingerprint = ? AND is_used = 1 
+                ORDER BY activated_at DESC 
+                LIMIT 1
+            ");
+            $stmt->execute([$fingerprint]);
+            $activeNyukuKey = $stmt->fetch();
+
+            if (!$activeNyukuKey) {
+                // Clear tblregistration if no valid active key exists in tblnyuku
+                $this->pdo->exec("DELETE FROM tblregistration");
+                return ['valid' => false, 'message' => 'System subscription inactive. Please enter a valid activation key.'];
+            }
+
+            // 2. CHECK EXPIRATION TIMESTAMP FROM tblnyuku
+            $expiresAtTimestamp = strtotime((string)$activeNyukuKey['expires_at']);
+            if ($expiresAtTimestamp === false || time() > $expiresAtTimestamp) {
+                // Lock key out in tblnyuku (is_used = 2 for expired) and purge tblregistration
+                $lockStmt = $this->pdo->prepare("UPDATE tblnyuku SET is_used = 2 WHERE id = ?");
+                $lockStmt->execute([$activeNyukuKey['id']]);
+
+                $this->pdo->exec("DELETE FROM tblregistration");
+
+                return [
+                    'valid'   => false, 
+                    'message' => 'Subscription expired on ' . date('d M Y', $expiresAtTimestamp) . '. Please enter a new renewal key.'
+                ];
+            }
+
+            return ['valid' => true, 'message' => 'Subscription Active'];
+        } catch (Exception $e) {
+            return ['valid' => false, 'message' => 'License Error: ' . $e->getMessage()];
+        }
+    }
+}
+
+$licenseMgr = new LicenseManager($pdo);
+
+// ----------------------------------------------------
+// HANDLER: ACTIVATION WITH SECRET KEY
+// ----------------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'activate_license') {
+    header('Content-Type: application/json');
+    $activationToken = trim($_POST['activation_token'] ?? '');
+    
+    $result = $licenseMgr->activateWithKey($activationToken);
+    echo json_encode($result);
+    exit;
+}
+
+// Perform Live Database License Validation on Every Page Load / Refresh
+$licenseStatus = $licenseMgr->validateLicense();
+
+if (!$licenseStatus['valid']) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        header('Content-Type: application/json');
+        echo json_encode(['status' => 'error', 'message' => 'LICENSE ERROR: ' . $licenseStatus['message']]);
+        exit;
+    }
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Subscription Activation</title>
+        <style>
+            body { background: #0f172a; color: #f8fafc; font-family: system-ui, sans-serif; display: flex; height: 100vh; justify-content: center; align-items: center; margin: 0; }
+            .card { background: #1e293b; padding: 35px; border-radius: 12px; border: 1px solid #334155; text-align: center; width: 440px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+            h2 { color: #ef4444; margin-bottom: 8px; font-size: 22px; }
+            p { color: #94a3b8; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+            .fp { background: #0f172a; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 11px; color: #38bdf8; word-break: break-all; margin-bottom: 20px; }
+            input[type="text"] { width: 100%; padding: 12px; font-size: 16px; border: 1px solid #475569; background: #0f172a; color: #fff; border-radius: 6px; margin-bottom: 15px; box-sizing: border-box; font-family: monospace; text-align: center; outline: none; }
+            input[type="text"]:focus { border-color: #38bdf8; }
+            button { width: 100%; padding: 12px; background: #1b4998; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 15px; }
+            button:hover { background: #143775; }
+            .msg { padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 15px; display: none; }
+            .msg-error { background: #450a0a; color: #fca5a5; border: 1px solid #991b1b; }
+            .msg-success { background: #052e16; color: #86efac; border: 1px solid #166534; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Subscription Activation Required</h2>
+            <p><?php echo htmlspecialchars($licenseStatus['message']); ?></p>
+            
+            <div style="font-size: 11px; color: #64748b; margin-bottom: 4px; font-weight: bold;">HARDWARE FINGERPRINT:</div>
+            <div class="fp"><?php echo $licenseMgr->getSystemFingerprint(); ?></div>
+
+            <div id="msgBox" class="msg"></div>
+
+            <form id="activationForm">
+                <input type="text" id="activation_token" placeholder="Enter Nyuku Secret Key (e.g. NYUKU-A1B2-C3D4)" required autocomplete="off">
+                <button type="submit">Activate Subscription</button>
+            </form>
+        </div>
+
+        <script>
+            document.getElementById('activationForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+                const msgBox = document.getElementById('msgBox');
+                msgBox.style.display = 'none';
+
+                const formData = new FormData();
+                formData.append('action', 'activate_license');
+                formData.append('activation_token', document.getElementById('activation_token').value.trim());
+
+                fetch('index.php', { method: 'POST', body: formData })
+                .then(res => res.json())
+                .then(data => {
+                    msgBox.innerText = data.message;
+                    if (data.status === 'success') {
+                        msgBox.className = 'msg msg-success';
+                        msgBox.style.display = 'block';
+                        setTimeout(() => { window.location.reload(); }, 1200);
+                    } else {
+                        msgBox.className = 'msg msg-error';
+                        msgBox.style.display = 'block';
+                    }
+                })
+                .catch(() => {
+                    msgBox.innerText = 'Server processing error.';
+                    msgBox.className = 'msg msg-error';
+                    msgBox.style.display = 'block';
+                });
+            });
+        </script>
+    </body>
+    </html>
+    <?php
+    exit;
 }
 
 // ----------------------------------------------------
@@ -554,7 +769,6 @@ $initialCart = getCartState($pdo);
 
         .main-container { display: flex; flex: 1; overflow: hidden; padding: 12px; gap: 12px; }
         
-        /* Left Section: Item Grid & Search */
         .left-panel { flex: 1.1; display: flex; flex-direction: column; background: #ffffff; border-radius: 8px; border: 1px solid var(--pos-border); padding: 12px; }
         .search-box { width: 100%; padding: 14px; font-size: 16px; border: 2px solid var(--pos-border); background: #ffffff; color: #0f172a; border-radius: 6px; margin-bottom: 12px; outline: none; font-weight: 600; }
         .search-box:focus { border-color: var(--pos-blue); }
@@ -567,7 +781,6 @@ $initialCart = getCartState($pdo);
             border-radius: 6px; 
             padding: 12px; 
             cursor: pointer; 
-            transition: background-color 0.15s ease, transform 0.1s ease; 
             display: flex; 
             flex-direction: column; 
             justify-content: space-between; 
@@ -577,11 +790,7 @@ $initialCart = getCartState($pdo);
             background-color: var(--pos-blue-hover);
             transform: translateY(-2px);
         }
-        .product-card .title { font-size: 13px; font-weight: 700; line-height: 1.3; margin-bottom: 8px; text-transform: uppercase; }
-        .product-card .price { font-size: 16px; font-weight: 800; }
-        .product-card .soh { font-size: 11px; font-weight: 600; opacity: 0.85; margin-top: 4px; }
 
-        /* Right Section: Split Register View */
         .right-panel { flex: 1; display: flex; flex-direction: column; gap: 10px; }
         
         .cart-table-wrapper { flex: 1; overflow-y: auto; border: 1px solid var(--pos-border); border-radius: 6px; background: #ffffff; }
@@ -590,17 +799,14 @@ $initialCart = getCartState($pdo);
         td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; color: #1e293b; font-weight: 600; }
         tr:hover { background: #f8fafc; }
         
-        /* Total Display Box */
         .pos-display-panel { background: #e2e8f0; border-radius: 6px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border: 1px solid #cbd5e1; }
         .pos-display-label { font-size: 14px; font-weight: 800; color: #334155; text-transform: uppercase; }
         .pos-display-total { font-size: 2rem; font-weight: 900; color: #0f172a; font-family: monospace; }
         .pos-vat-sub { font-size: 12px; color: #64748b; font-weight: 600; }
 
-        /* Keypad / Control Actions Grid */
         .actions-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-        .btn-pos { border: none; border-radius: 6px; padding: 14px 10px; font-size: 15px; font-weight: 800; cursor: pointer; transition: filter 0.15s ease; text-align: center; color: #ffffff; text-transform: uppercase; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .btn-pos { border: none; border-radius: 6px; padding: 14px 10px; font-size: 15px; font-weight: 800; cursor: pointer; text-align: center; color: #ffffff; text-transform: uppercase; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .btn-pos:hover { filter: brightness(0.9); }
-        .btn-pos:active { transform: translateY(1px); }
 
         .btn-pos-green  { background-color: var(--pos-green); }
         .btn-pos-blue   { background-color: var(--pos-blue); }
@@ -616,7 +822,80 @@ $initialCart = getCartState($pdo);
         .modal-content input:focus { border-color: var(--pos-blue); background: #ffffff; }
         .modal-btns { display: flex; gap: 10px; }
 
-        /* Thermal Till Receipt Slip Layout */
+        /* ----------------------------------------------------
+           UI KEYFRAME ANIMATIONS & MICRO-INTERACTIONS
+        ---------------------------------------------------- */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes cartPulse {
+            0% { background-color: #dcfce7; }
+            50% { background-color: #86efac; }
+            100% { background-color: transparent; }
+        }
+
+        @keyframes modalPop {
+            from { opacity: 0; transform: scale(0.92); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        @keyframes priceBump {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.08); color: #0284c7; }
+            100% { transform: scale(1); }
+        }
+
+        .main-container {
+            animation: fadeIn 0.3s ease-out forwards;
+        }
+
+        .product-card {
+            transition: transform 0.15s cubic-bezier(0.4, 0, 0.2, 1), 
+                        background-color 0.15s ease, 
+                        box-shadow 0.15s ease;
+        }
+
+        .product-card:active {
+            transform: scale(0.95) !important;
+        }
+
+        #cartItems tr {
+            animation: fadeIn 0.2s ease-out;
+            transition: background-color 0.2s ease;
+        }
+
+        #cartItems tr.new-item {
+            animation: cartPulse 0.6s ease-out;
+        }
+
+        .pos-display-total {
+            transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), color 0.2s ease;
+            display: inline-block;
+        }
+
+        .pos-display-total.bump {
+            animation: priceBump 0.3s ease-out;
+        }
+
+        .modal {
+            transition: opacity 0.2s ease;
+        }
+
+        .modal-content {
+            animation: modalPop 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .btn-pos {
+            transition: transform 0.1s ease, filter 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .btn-pos:active {
+            transform: translateY(2px) scale(0.97);
+            box-shadow: none;
+        }
+
         #receiptContainer {
             display: none;
             width: 320px;
@@ -638,7 +917,6 @@ $initialCart = getCartState($pdo);
         .receipt-qr-wrapper { display: flex; flex-direction: column; align-items: center; margin: 15px 0 10px 0; }
         .receipt-footer-text { display: flex; justify-content: space-between; font-weight: bold; margin-top: 12px; font-size: 12px; }
 
-        /* Document Invoice Layout */
         #invoiceContainer {
             display: none;
             background: #ffffff;
@@ -730,13 +1008,11 @@ $initialCart = getCartState($pdo);
 </header>
 
 <div class="main-container">
-    <!-- Item Search & Grid -->
     <div class="left-panel">
         <input type="text" id="searchInput" class="search-box" placeholder="Scan barcode or search item..." autofocus>
         <div class="product-grid" id="productGrid"></div>
     </div>
 
-    <!-- Active Register Controls -->
     <div class="right-panel">
         <div class="cart-table-wrapper">
             <table>
@@ -782,7 +1058,6 @@ $initialCart = getCartState($pdo);
     </div>
 </div>
 
-<!-- Option 1: Thermal Till Receipt Slip Output -->
 <div id="receiptContainer">
     <?php if (!empty($companyInfo['image'])): ?>
         <div style="text-align: center; margin-bottom: 8px;">
@@ -840,7 +1115,6 @@ $initialCart = getCartState($pdo);
     </div>
 </div>
 
-<!-- Option 2: Document Invoice Layout Output -->
 <div id="invoiceContainer">
     <div class="inv-layout">
         <div class="inv-sidebar">
@@ -946,7 +1220,6 @@ $initialCart = getCartState($pdo);
             timer = setTimeout(searchProducts, 200);
         });
 
-        // BARCODE SCAN / ENTER KEY PRESS EVENT
         searchInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 e.preventDefault();
@@ -957,7 +1230,6 @@ $initialCart = getCartState($pdo);
             }
         });
 
-        // KEYBOARD SHORTCUT ENGINE
         document.addEventListener('keydown', (e) => {
             if (e.key === 'F10') {
                 e.preventDefault();
@@ -975,7 +1247,6 @@ $initialCart = getCartState($pdo);
             }
         });
 
-        // Safe reload when print dialog completes or closes
         window.addEventListener('afterprint', () => {
             window.location.reload();
         });
@@ -1047,6 +1318,7 @@ $initialCart = getCartState($pdo);
         
         cart.items.forEach(item => {
             const tr = document.createElement('tr');
+            tr.className = 'new-item'; // Triggers smooth green row pulse
             tr.innerHTML = `
                 <td>${item.Description}</td>
                 <td style="text-align: center;">${parseInt(item.Qty)}</td>
@@ -1056,8 +1328,15 @@ $initialCart = getCartState($pdo);
             tbody.appendChild(tr);
         });
 
+        const totalElem = document.getElementById('totalAmount');
+        if (totalElem.innerText !== `E ${cart.total}`) {
+            totalElem.classList.remove('bump');
+            void totalElem.offsetWidth; // Force CSS reflow to re-trigger pulse
+            totalElem.classList.add('bump');
+        }
+
         document.getElementById('vatAmount').innerText = `E ${cart.vat}`;
-        document.getElementById('totalAmount').innerText = `E ${cart.total}`;
+        totalElem.innerText = `E ${cart.total}`;
     }
 
     function getCartPayload() {
@@ -1187,8 +1466,14 @@ $initialCart = getCartState($pdo);
             if (confirm(`Process ${method} Payment for E ${total.toFixed(2)}?`)) processCheckout();
         } else {
             document.getElementById('modalTitle').innerText = 'Cash Tendered';
-            document.getElementById('checkoutModal').style.display = 'flex';
+            const modal = document.getElementById('checkoutModal');
+            modal.style.opacity = '0';
+            modal.style.display = 'flex';
             
+            requestAnimationFrame(() => {
+                modal.style.opacity = '1';
+            });
+
             setTimeout(() => {
                 inputElem.focus();
                 inputElem.select();
