@@ -10,7 +10,7 @@ $isJsonRequest = (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERV
     || isset($_GET['format']) && $_GET['format'] === 'json';
 
 $dbHost = 'localhost';
-$dbName = 'aberrant';
+$dbName = '';
 $dbUser = 'root';
 $dbPass = '';
 

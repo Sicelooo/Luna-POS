@@ -1,8 +1,8 @@
 <?php
 $db_host = 'localhost';
-$db_name = 'aberrant';
+$db_name = '';
 $db_user = 'root';
-$db_pass = '@b3rrAntS0ft'; // Set your MySQL password here
+$db_pass = ''; // Set your MySQL password here
 
 try {
     $pdo = new PDO("mysql:host={$db_host};dbname={$db_name};charset=utf8mb4", $db_user, $db_pass, [
