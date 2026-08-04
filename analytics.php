@@ -1,12 +1,12 @@
 <?php
 // ---------------------------------------------------------------------
 // Database Connection
-// Database name: aberrant
+// Database name: 
 // ---------------------------------------------------------------------
 $dbHost = 'localhost';
-$dbName = 'aberrant'; 
+$dbName = ''; 
 $dbUser = 'root';
-$dbPass = '@b3rrAntS0ft';
+$dbPass = '@';
 
 try {
     $pdo = new PDO("mysql:host=$dbHost;dbname=$dbName;charset=utf8mb4", $dbUser, $dbPass, [
